@@ -1,7 +1,10 @@
-import type { Provider, DetectResult, ModelInfo, Capabilities, Mode } from "../types.js";
+import type { Provider, DetectResult, ModelInfo, Capabilities, Mode, LaunchCommand } from "../types.js";
 import { killTree, spawnBin, type ResolveResult } from "../../util/bin.js";
 import { resolveFirstBin } from "../../util/bin.js";
+import { resolveLaunch } from "../launch.js";
+import { PLACEHOLDER_MODEL_NAME } from "../types.js";
 import { AcpSession } from "./session.js";
+import { knownPromptCaps } from "./promptCaps.js";
 
 export type AcpProviderConfig = {
   id: string;
@@ -10,11 +13,15 @@ export type AcpProviderConfig = {
   /** Takes precedence over binName: detect / listModels / session resolve these in order */
   binCandidates?: string[];
   acpArgs: string[];
+  /** Arguments for one session's ACP process from its model (dsh starts on the conversation's route); default acpArgs */
+  argsFor?: (model: string | null) => Promise<string[]>;
+  /** The Agent decides at initialize whether it takes images, for the model it started on (dsh): a model picked later sends images by path */
+  imagesFollowStartModel?: boolean;
   installHint: string;
   appVersion?: string;
   flavor?: "cursor" | "generic";
   capabilities?: Capabilities;
-  fetchModels?: (r: ResolveResult & { ok: true }) => Promise<ModelInfo[]>;
+  fetchModels?: (r: ResolveResult & { ok: true }, launchArgs?: string[]) => Promise<ModelInfo[]>;
   /** Our permission modes → this Agent's mode names over ACP; when given, only modes in the table are shown */
   modeMap?: Partial<Record<Mode, string>>;
   /** Mode names shown in the UI (the Agent's own naming) */
@@ -31,6 +38,7 @@ export const acpCapabilities: Capabilities = {
   cost: false,
   effort: [],
   modes: ["plan", "default", "acceptEdits", "bypassPermissions"],
+  deltasOnly: true,
 };
 
 export const cursorAcpCapabilities: Capabilities = {
@@ -75,35 +83,43 @@ export function createAcpProvider(cfg: AcpProviderConfig): Provider {
   return {
     id: cfg.id,
     name: cfg.name,
-    capabilities: caps,
-    async detect(): Promise<DetectResult> {
-      const r = await resolveProviderBin(cfg);
+    // images is what the Agent's own initialize says (probe at warm-up / providers.list, or any session); until then unknown
+    get capabilities(): Capabilities {
+      const learned = knownPromptCaps(cfg.id);
+      return learned ? { ...caps, images: learned.image, imagesKnown: true } : { ...caps, images: false, imagesKnown: false };
+    },
+    async detect(launch?: LaunchCommand): Promise<DetectResult> {
+      const r = launch ? await resolveLaunch(launch) : await resolveProviderBin(cfg);
       if (!r.ok) {
         return { available: false, reason: r.reason, installHint: cfg.installHint };
       }
       let version: string | undefined;
+      const versionArgs = cfg.id === "devin" ? ["version"] : ["cursor", "opencode"].includes(cfg.id) ? ["--version"] : null;
       try {
-        if (cfg.id === "cursor") {
-          version = (await runVersion(r, ["--version"])).split(/\r?\n/)[0]?.trim();
-        } else if (cfg.id === "devin") {
-          version = (await runVersion(r, ["version"])).split(/\r?\n/)[0]?.trim();
-        } else if (cfg.id === "opencode") {
-          version = (await runVersion(r, ["--version"])).split(/\r?\n/)[0]?.trim();
+        if (versionArgs) {
+          // Only the internal prefix: the user's extra args are meant for the ACP command, not for --version
+          version = (await runVersion(r, [...(launch?.prefixArgs ?? []), ...versionArgs])).split(/\r?\n/)[0]?.trim();
         }
       } catch {
         /* Having the binary is enough */
       }
       return { available: true, bin: r.display, version };
     },
-    async listModels(): Promise<ModelInfo[]> {
-      const r = await resolveProviderBin(cfg);
-      if (!r.ok) return [{ id: "default", name: "默认", isDefault: true }];
-      if (cfg.fetchModels) return cfg.fetchModels(r);
-      return [{ id: "default", name: "默认", isDefault: true }];
+    async listModels(launch?: LaunchCommand): Promise<ModelInfo[]> {
+      const resolved = launch ? await resolveLaunch(launch) : await resolveProviderBin(cfg);
+      if (!resolved.ok) return [{ id: "default", name: PLACEHOLDER_MODEL_NAME, isDefault: true }];
+      // The internal prefix rides on the resolution (fetchModels puts its own ACP args after it), the user's args go last
+      const r = launch?.prefixArgs?.length && resolved.via !== "cmd-shim"
+        ? { ...resolved, prefixArgs: [...resolved.prefixArgs, ...launch.prefixArgs] }
+        : resolved;
+      if (cfg.fetchModels) return cfg.fetchModels(r, launch?.args ?? []);
+      return [{ id: "default", name: PLACEHOLDER_MODEL_NAME, isDefault: true }];
     },
     async createSession(o) {
       return new AcpSession({
         threadId: o.threadId,
+        providerId: cfg.id,
+        providerName: cfg.name,
         cwd: o.cwd,
         model: o.model,
         mode: o.mode,
@@ -111,7 +127,8 @@ export function createAcpProvider(cfg: AcpProviderConfig): Provider {
         resumeId: o.resumeId,
         binName: cfg.binName,
         binCandidates: cfg.binCandidates ?? [cfg.binName],
-        acpArgs: cfg.acpArgs,
+        acpArgs: cfg.argsFor ? await cfg.argsFor(o.model) : cfg.acpArgs,
+        imagesFollowStartModel: cfg.imagesFollowStartModel,
         appVersion: cfg.appVersion ?? "0.0.1",
         flavor: cfg.flavor ?? "generic",
         modeMap: cfg.modeMap,

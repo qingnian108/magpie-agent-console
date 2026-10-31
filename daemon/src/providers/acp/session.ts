@@ -2,14 +2,19 @@
 import type { ActiveSession, ClientConnection, ClientContext } from "@agentclientprotocol/sdk";
 import { client, methods, PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
 import type { ChildProcess } from "node:child_process";
-import type { ProviderSession, SendInput, RespondAnswer, Mode, SlashCommand } from "../types.js";
+import type { LaunchCommand, ProviderSession, SendInput, RespondAnswer, Mode, SlashCommand } from "../types.js";
 import { mapAcpAvailableCommands, sortSlashCommands } from "../slash.js";
 import type { ProviderEvent } from "../../timeline/types.js";
 import { AsyncQueue } from "../../util/queue.js";
 import { resolveFirstBin, type ResolveResult } from "../../util/bin.js";
+import { launchArgv, resolveLaunch } from "../launch.js";
 import { absCwd, acpStreamFromChild, killAcpChild, spawnResolved } from "./spawn.js";
 import { registerAcpClientHandlers } from "./clientHandlers.js";
 import { mapSessionUpdate, newMapCtx, stopToTurnEnd, type MapCtx } from "./mapUpdate.js";
+import { promptCapsFromInitialize, rememberPromptCaps, type AcpPromptCaps } from "./promptCaps.js";
+import { pickReconnect, sessionOpenFromInitialize } from "./sessionCaps.js";
+import { buildAcpPrompt } from "./prompt.js";
+import { tr } from "../../util/i18n.js";
 
 type AcpSelectValue = { value?: string; name?: string; options?: AcpSelectValue[] };
 type AcpConfigOption = { id: string; category?: string | null; type?: string; currentValue?: unknown; options?: AcpSelectValue[] };
@@ -18,11 +23,14 @@ import { log } from "../../log.js";
 const rid = () => Math.random().toString(36).slice(2, 10);
 
 type AttachableCtx = {
-  attachSession(response: { sessionId: string; modes?: unknown }): ActiveSession;
+  attachSession(response: { sessionId: string; modes?: unknown; configOptions?: unknown }): ActiveSession;
 };
 
 export type AcpSessionOpts = {
   threadId: string;
+  /** Provider id and display name: the Agent's prompt capabilities are remembered under the id; notices name the Agent */
+  providerId?: string;
+  providerName?: string;
   cwd: string;
   model: string | null;
   mode: Mode;
@@ -31,12 +39,14 @@ export type AcpSessionOpts = {
   binName: string;
   binCandidates: string[];
   acpArgs: string[];
+  /** initialize's image answer holds for the start model only (dsh): after a switch, images go by path */
+  imagesFollowStartModel?: boolean;
   appVersion: string;
   flavor: "cursor" | "generic";
   modeMap?: Partial<Record<Mode, string>>;
   cursorFast?: boolean;
   cursorAutoReview?: boolean;
-  launch?: { cmd: string; prefixArgs: string[] };
+  launch?: LaunchCommand;
 };
 
 export class AcpSession implements ProviderSession {
@@ -61,6 +71,10 @@ export class AcpSession implements ProviderSession {
   private slashCommands: SlashCommand[] = [];
   private activeTurnId: string | null = null;
   private configOptions: AcpConfigOption[] | null = null;
+  // initialize → agentCapabilities.promptCapabilities (ACP baseline until initialize answers: text + resource_link)
+  private promptCaps: AcpPromptCaps = { image: false, audio: false, embeddedContext: false };
+  private initCaps: AcpPromptCaps = this.promptCaps;
+  private startModel: string | null = null;
   private wakePump: (() => void) | null = null;
   // listCommands waits for the first batch of commands (or confirmation there are none), following Paseo's waitForInitialCommands
   private commandsReady!: Promise<void>;
@@ -68,6 +82,7 @@ export class AcpSession implements ProviderSession {
 
   constructor(private o: AcpSessionOpts) {
     this.events = this.q;
+    this.startModel = o.model; // the model the process is launched for (argsFor), before any setModel
     this.cursorFast = o.cursorFast ?? false;
     // The shield (auto-accept permission prompts) UI was removed: never auto-approve, so conversations that once turned it on don't keep approving with the toggle hidden
     this.cursorAutoReview = false;
@@ -77,18 +92,11 @@ export class AcpSession implements ProviderSession {
 
   private async boot(): Promise<void> {
     const bin = this.o.launch
-      ? ({
-          ok: true as const,
-          cmd: this.o.launch.cmd,
-          prefixArgs: this.o.launch.prefixArgs,
-          display: this.o.launch.cmd,
-          via: "custom",
-          binName: "custom",
-        } satisfies ResolveResult & { ok: true; binName: string })
+      ? await resolveLaunch(this.o.launch).then((r) => r.ok ? ({ ...r, binName: "custom" } as ResolveResult & { ok: true; binName: string }) : r)
       : await resolveFirstBin(this.o.binCandidates?.length ? this.o.binCandidates : [this.o.binName]);
     if (!bin.ok) throw new Error(bin.reason);
     try {
-      this.child = spawnResolved(bin, this.o.acpArgs, { cwd: this.o.cwd });
+      this.child = spawnResolved(bin, launchArgv(this.o.acpArgs, this.o.launch), { cwd: this.o.cwd });
       this.child.stderr?.on("data", (d: Buffer) => {
         const t = d.toString().trim();
         if (t) log("info", `[${this.o.binName} acp] ${t.slice(0, 500)}`);
@@ -96,7 +104,7 @@ export class AcpSession implements ProviderSession {
       this.child.on("error", (e) => this.failInit(e));
       this.child.on("close", (code) => {
         if (!this.closed && code !== 0) {
-          this.q.push({ type: "notice", level: "error", message: `${this.o.binName} 进程退出 (${code})` });
+          this.q.push({ type: "notice", level: "error", message: tr("acp.exited", { name: this.o.binName, code: String(code) }) });
         }
       });
 
@@ -109,26 +117,40 @@ export class AcpSession implements ProviderSession {
       const stream = acpStreamFromChild(this.child);
       this.conn = app.connect(stream);
       this.ctx = this.conn.agent;
-      await this.ctx.request(methods.agent.initialize, {
+      const initRes = await this.ctx.request(methods.agent.initialize, {
         protocolVersion: PROTOCOL_VERSION,
         // Cursor: declare support for the parameterized model picker (as Paseo does); only then does it expose levels / Fast as separate config options
         clientCapabilities: this.o.flavor === "cursor" ? { _meta: { parameterizedModelPicker: true } } : {},
         clientInfo: { name: "Agent Console", version: this.o.appVersion },
       });
+      this.promptCaps = promptCapsFromInitialize(initRes);
+      this.initCaps = this.promptCaps;
+      rememberPromptCaps(this.o.providerId, this.promptCaps);
 
       const cwd = absCwd(this.o.cwd);
       const ctx = this.ctx;
       if (!ctx) throw new Error("ACP 未连接");
       if (this.o.resumeId) {
-        const loaded = await ctx.request(methods.agent.session.load, {
-          sessionId: this.o.resumeId,
-          cwd,
-          mcpServers: [],
-        });
-        this.active = (ctx as unknown as AttachableCtx).attachSession({
-          sessionId: this.o.resumeId,
-          modes: loaded.modes,
-        });
+        // Prefer the method the Agent's initialize advertises: load (replays history) over resume (reconnects only); neither → new session + notice
+        const how = pickReconnect(sessionOpenFromInitialize(initRes));
+        if (how === "load" || how === "resume") {
+          const method = how === "load" ? methods.agent.session.load : methods.agent.session.resume;
+          const restored = (await ctx.request(method, {
+            sessionId: this.o.resumeId,
+            cwd,
+            mcpServers: [],
+          })) as { modes?: unknown; configOptions?: AcpConfigOption[] };
+          this.active = (ctx as unknown as AttachableCtx).attachSession({
+            sessionId: this.o.resumeId,
+            modes: restored.modes,
+            configOptions: restored.configOptions,
+          });
+          if (Array.isArray(restored.configOptions)) this.configOptions = restored.configOptions;
+        } else {
+          this.active = await ctx.buildSession(cwd).start();
+          const agent = this.o.providerName ?? this.o.binName;
+          this.q.push({ type: "notice", level: "warn", message: tr("notice.acpSessionNotRestored", { agent }) });
+        }
       } else {
         this.active = await ctx.buildSession(cwd).start();
       }
@@ -367,20 +389,35 @@ export class AcpSession implements ProviderSession {
       effort: this.o.effort,
     });
     const text = input.text.trim();
-    if (!text) {
+    const attachments = input.images ?? [];
+    if (!text && !attachments.length) {
       this.running = false;
       this.q.push({ type: "turn_ended", turnId: this.turnId, status: "completed" });
       return;
     }
-    void this.runTurn(text);
+    // An image-only message is still a prompt: images go as image blocks when the Agent takes them, else by file path
+    const built = await buildAcpPrompt(text, attachments, this.promptCaps);
+    const agent = this.o.providerName ?? this.o.binName;
+    if (built.imagesByPath.length && !this.promptCaps.image) {
+      const switched = this.o.imagesFollowStartModel && this.initCaps.image && this.o.model !== this.startModel;
+      this.q.push({ type: "notice", level: "warn", message: tr(switched ? "notice.acpImageByPathSwitched" : "notice.acpImageByPath", { agent, paths: built.imagesByPath.join(", ") }) });
+    }
+    for (const w of built.warnings) this.q.push({ type: "notice", level: "warn", message: tr("notice.attachmentIssue", { detail: w }) });
+    if (!built.blocks.length) {
+      // Every attachment failed to resolve and there was no text: nothing to send
+      this.running = false;
+      this.q.push({ type: "turn_ended", turnId: this.turnId, status: "completed" });
+      return;
+    }
+    void this.runTurn(built.blocks);
   }
 
   // Send this turn's prompt; reading updates is the job of the persistent pumpUpdates() (following Paseo: session/update is handled at session level)
-  private async runTurn(text: string): Promise<void> {
+  private async runTurn(prompt: Parameters<ActiveSession["prompt"]>[0]): Promise<void> {
     this.activeTurnId = this.turnId;
     this.wakePump?.();
     this.wakePump = null;
-    this.active!.prompt(text).catch(() => {
+    this.active!.prompt(prompt).catch(() => {
       /* failures surface through nextUpdate() and pumpUpdates ends the turn */
     });
   }
@@ -440,6 +477,10 @@ export class AcpSession implements ProviderSession {
   async setModel(model: string | null): Promise<void> {
     this.o.model = model;
     await this.ready();
+    if (this.o.imagesFollowStartModel) {
+      // dsh answered initialize for the model it started on; another model may not take image blocks (it refuses the prompt)
+      this.promptCaps = model === this.startModel ? this.initCaps : { ...this.initCaps, image: false };
+    }
     await this.applySessionModel(model);
   }
 
